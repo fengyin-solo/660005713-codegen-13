@@ -1,4 +1,5 @@
 import random, math
+from typing import Optional
 import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -176,3 +177,79 @@ def analyze_roi(req: ROIAnalyzeRequest):
 @app.get("/api/windows")
 def get_windows():
     return {"presets": WINDOW_PRESETS}
+
+
+class QualityRequest(BaseModel):
+    volume: Optional[list] = None
+    preset: str = "brain"
+
+
+def _smooth3(v: np.ndarray) -> np.ndarray:
+    """3-point moving average along each axis (numpy only)."""
+    s = v.astype(np.float32)
+    for ax in range(3):
+        s = (np.roll(s, 1, axis=ax) + s + np.roll(s, -1, axis=ax)) / 3.0
+    return s
+
+
+@app.post("/api/quality")
+def assess_quality(req: QualityRequest):
+    """影像质量综合评估：返回噪声水平、层厚不均、伪影比例三项归一化指标。
+
+    评分阈值与权重由前端持有，因此用户调整后可即时重算结论。
+    """
+    if req.volume is None:
+        return {"ok": False, "reason": "影像数据缺失：未接收到体数据，请重新载入影像后重试", "metrics": None}
+
+    try:
+        vol = np.array(req.volume, dtype=np.float32)
+    except Exception:
+        return {"ok": False, "reason": "影像数据格式错误：无法解析为数值体数据", "metrics": None}
+
+    if vol.ndim != 3:
+        return {"ok": False, "reason": f"影像数据维度异常：期望三维体数据，实际为 {vol.ndim} 维，无法评估", "metrics": None}
+    if min(vol.shape) < 2:
+        return {"ok": False, "reason": "影像数据不完整：体数据尺寸过小，无法计算层厚不均指标", "metrics": None}
+    if not np.isfinite(vol).all():
+        return {"ok": False, "reason": "影像数据包含无效值（NaN/Inf），无法得出质量结论", "metrics": None}
+
+    sigma_all = float(vol.std())
+    if sigma_all < 1e-6:
+        return {"ok": False, "reason": "影像无有效信号（体数据为常量），无法评估噪声与伪影", "metrics": None}
+
+    # 1) 噪声水平：中央 1/4 均匀区内，原始体素与三维平滑体素残差的中位绝对偏差(MAD)，
+    #    对骨骼边缘与离群伪影稳健（临床噪声测量惯例取均匀区 ROI）
+    residual = vol - _smooth3(vol)
+    d, h, w = vol.shape
+    z0, z1 = d * 3 // 8, d * 5 // 8
+    y0, y1 = h * 3 // 8, h * 5 // 8
+    x0, x1 = w * 3 // 8, w * 5 // 8
+    center_res = np.abs(residual[z0:z1, y0:y1, x0:x1])
+    center_tissue = np.abs(vol[z0:z1, y0:y1, x0:x1]) > 1e-3
+    if int(center_tissue.sum()) < 8:
+        return {"ok": False, "reason": "有效组织体素过少，无法得出质量结论", "metrics": None}
+    noise_std = float(1.4826 * np.median(center_res[center_tissue]))
+    noise_level = min(1.0, noise_std / 15.0)  # 残差15HU视为满档噪声
+
+    # 2) 层厚不均：相邻层面平均密度的跳变程度（按整体信号尺度归一化）
+    slice_means = vol.reshape(d, -1).mean(axis=1)
+    slice_diff = float(np.abs(np.diff(slice_means)).mean())
+    slice_unevenness = min(1.0, slice_diff / (abs(float(slice_means.mean())) + 1e-6) / 0.3)
+
+    # 3) 伪影比例：超出均值 ±4σ 的离群体素占比
+    mu = float(vol.mean())
+    outlier_ratio = float((np.abs(vol - mu) > 4 * sigma_all).mean())
+    artifact_ratio = min(1.0, outlier_ratio / 0.02)  # 2% 离群视为满档伪影
+
+    return {
+        "ok": True,
+        "reason": None,
+        "metrics": {
+            "noiseLevel": round(noise_level, 4),
+            "sliceUnevenness": round(slice_unevenness, 4),
+            "artifactRatio": round(artifact_ratio, 4),
+            "noiseStdHU": round(noise_std, 2),
+            "sliceMeanDiffHU": round(slice_diff, 2),
+            "outlierRatio": round(outlier_ratio, 5),
+        },
+    }

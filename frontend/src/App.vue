@@ -19,6 +19,7 @@
           <div class="mpr-panel"><div class="mpr-title">矢状面</div><MPRView plane="sagittal" /></div>
         </div>
         <WindowControl />
+        <QualityPanel />
         <ROIPanel />
       </div>
     </div>
@@ -32,6 +33,7 @@
 import VolumeRenderer from './components/VolumeRenderer.vue'
 import MPRView from './components/MPRView.vue'
 import WindowControl from './components/WindowControl.vue'
+import QualityPanel from './components/QualityPanel.vue'
 import ROIPanel from './components/ROIPanel.vue'
 import { useImagingStore } from './store/imaging'
 const store = useImagingStore()
