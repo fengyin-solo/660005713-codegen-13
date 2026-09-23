@@ -1,8 +1,11 @@
 import random, math
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List, Optional
+
+from app.services.quality import compute_quality_metrics, QualityComputeError
 
 app = FastAPI(title="Medical Imaging Viewer")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -104,12 +107,54 @@ def generate_volume(preset: str, w: int, h: int, d: int):
                             base = 250 + np.random.uniform(-10, 10)
                         vol[z, y, x] = base + np.random.uniform(-9, 9)
 
-    return vol.tolist()
+    vol = inject_synthetic_degradation(vol, preset)
+    return vol
+
+
+# 各预设的层厚元信息（模拟实际扫描中不均匀的重建层间隔）
+SLICE_THICKNESSES = {
+    "brain":   [5.0] * 64,
+    "chest":   [round(5.0 + 0.5 * math.sin(i / 64 * 2 * math.pi * 2), 3) for i in range(64)],
+    "abdomen": [round(5.0 + 0.9 * math.sin(i / 64 * 2 * math.pi * 3) + 0.3 * math.sin(i * 3.7), 3)
+                for i in range(64)],
+}
+
+PRESET_NAMES = {"brain": "头部CT", "chest": "胸部CT", "abdomen": "腹部CT"}
+
+
+def inject_synthetic_degradation(vol: np.ndarray, preset: str) -> np.ndarray:
+    """向合成体数据注入确定性的真实感退化，用于质量评分演示。
+
+    brain  ：轻度高斯噪声；
+    chest  ：高斯噪声 + 金属植入体放射条带/拉链伪影；
+    abdomen：较强高斯噪声 + 扫描中患者运动（连续层段整体移位）。
+    """
+    rng = np.random.RandomState(7)
+    d, h, w = vol.shape
+    cy, cx = h // 2, w // 2
+
+    if preset == "brain":
+        vol = vol + rng.normal(0, 6, vol.shape).astype(np.float32)
+    elif preset == "chest":
+        vol = vol + rng.normal(0, 10, vol.shape).astype(np.float32)
+        # 金属植入体核心 + 穿过核心的拉链/条纹线
+        vol[20:45, cy - 7, cx] = 900
+        for z in (22, 26, 30, 34, 38):
+            vol[z, :, cx] = np.where(np.abs(np.arange(h) - cy) < 2, 900, vol[z, :, cx])
+            vol[z, cy - 7, :] = np.where(np.arange(w) % 2 == 0, 800, -300)
+    elif preset == "abdomen":
+        vol = vol + rng.normal(0, 14, vol.shape).astype(np.float32)
+        # 扫描过程中的患者运动：两段连续层在 x 方向整体移位
+        for z0, z1, shift in ((16, 30, 4), (40, 48, -3)):
+            vol[z0:z1] = np.roll(vol[z0:z1], shift, axis=2)
+    return vol
 
 
 @app.post("/api/volume")
 def get_volume(req: VolumeRequest):
     vol = generate_volume(req.preset, req.width, req.height, req.depth)
+    vol_list = vol.tolist()
+    thicknesses = _match_thicknesses(req.depth, SLICE_THICKNESSES.get(req.preset, []))
 
     # Extract mid slices for MPR
     mid_axial = int(req.depth // 2)
@@ -118,16 +163,43 @@ def get_volume(req: VolumeRequest):
 
     # Return: 3D volume + 3 MPR slices
     return {
-        "volume": vol,
+        "volume": vol_list,
         "dimensions": [req.depth, req.height, req.width],
+        "sliceThicknesses": thicknesses,
+        "seriesName": PRESET_NAMES.get(req.preset, req.preset),
         "mpr": {
-            "axial": vol[mid_axial],
-            "coronal": [[vol[z][mid_coronal][x] for x in range(req.width)] for z in range(req.depth)],
-            "sagittal": [[vol[z][y][mid_sagittal] for y in range(req.height)] for z in range(req.depth)]
+            "axial": vol_list[mid_axial],
+            "coronal": [[vol_list[z][mid_coronal][x] for x in range(req.width)] for z in range(req.depth)],
+            "sagittal": [[vol_list[z][y][mid_sagittal] for y in range(req.height)] for z in range(req.depth)]
         },
         "preset": req.preset,
         "windowPresets": WINDOW_PRESETS
     }
+
+
+def _match_thicknesses(depth: int, template: List[float]) -> List[float]:
+    """按当前层数对预设层厚序列做最近邻重采样。"""
+    if not template:
+        return []
+    if len(template) == depth:
+        return list(template)
+    idx = np.rint(np.linspace(0, len(template) - 1, depth)).astype(int)
+    return [float(template[i]) for i in idx]
+
+
+class QualityRequest(BaseModel):
+    volume: Optional[list] = None
+    sliceThicknesses: Optional[List[float]] = None
+
+
+@app.post("/api/quality")
+def quality(req: QualityRequest):
+    try:
+        metrics = compute_quality_metrics(req.volume, req.sliceThicknesses)
+    except QualityComputeError as exc:
+        # 数据缺失或算不出结论：返回明确原因，前端展示失败状态与重试入口
+        raise HTTPException(status_code=422, detail={"message": str(exc)})
+    return {"status": "ok", "metrics": metrics}
 
 
 class ROIAnalyzeRequest(BaseModel):

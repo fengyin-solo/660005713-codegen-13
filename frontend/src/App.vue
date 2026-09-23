@@ -13,6 +13,7 @@
     <div class="main-grid" v-if="store.volumeData">
       <div class="render-area"><VolumeRenderer /></div>
       <div class="mpr-area">
+        <QualityCard />
         <div class="mpr-row">
           <div class="mpr-panel"><div class="mpr-title">横断面 (轴位)</div><MPRView plane="axial" /></div>
           <div class="mpr-panel"><div class="mpr-title">冠状面</div><MPRView plane="coronal" /></div>
@@ -33,6 +34,7 @@ import VolumeRenderer from './components/VolumeRenderer.vue'
 import MPRView from './components/MPRView.vue'
 import WindowControl from './components/WindowControl.vue'
 import ROIPanel from './components/ROIPanel.vue'
+import QualityCard from './components/QualityCard.vue'
 import { useImagingStore } from './store/imaging'
 const store = useImagingStore()
 </script>
